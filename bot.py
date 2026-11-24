@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-BOT CUANTITATIVO SMC & SCALPING/DAYTRADING 24/7 (RENDER + UPTIMEROBOT)
+BOT CUANTITATIVO SMC & SCALPING/DAYTRADING 24/7
 Datos en tiempo real automáticos para:
-- BTCUSD (Binance / Kraken)
-- XAUUSD / Oro (Kraken PAXG + Yahoo Finance GC=F respaldo)
-- EURUSD (Kraken + Yahoo Finance EURUSD=X respaldo)
+- BTCUSD (Kraken / Binance)
+- XAUUSD / Oro (Kraken PAXG + Yahoo Finance GC=F)
+- EURUSD (Kraken + Yahoo Finance EURUSD=X)
 - NAS100 / NASDAQ (Yahoo Finance NQ=F)
 """
 
@@ -17,480 +17,525 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 
-# ------------------------------------------------------------------ #
+# ==========================================================
 # CONFIGURACIÓN Y VARIABLES DE ENTORNO
-# ------------------------------------------------------------------ #
+# ==========================================================
 TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not TOKEN:
-    raise SystemExit("Falta la variable de entorno BOT_TOKEN")
+ALLOWED_RAW = os.environ.get("ALLOWED_USER_ID", "").strip()
+ALLOWED_ID = int(ALLOWED_RAW) if ALLOWED_RAW.isdigit() else None
 
-ALLOWED_USER = str(os.environ.get("ALLOWED_USER_ID", "")).strip()
 URL = f"https://api.telegram.org/bot{TOKEN}"
-ALERTAS_FILE = "alertas_smc.json"
+ALERTAS_FILE = "alertas.json"
+LOCK = threading.Lock()
 
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
-log = logging.getLogger("smc-live")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("smcbot")
 
 sess = requests.Session()
-sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+sess.headers.update({"User-Agent": "Mozilla/5.0 (compatible; SMCQuantBot/2.0)"})
 
-ACTIVOS = {
-    "btc":    dict(code="BTCUSD", name="Bitcoin (BTC/USD)",   dec=2, kraken="XBTUSD",  yahoo="BTC-USD"),
-    "btcusd": dict(code="BTCUSD", name="Bitcoin (BTC/USD)",   dec=2, kraken="XBTUSD",  yahoo="BTC-USD"),
-    "oro":    dict(code="XAUUSD", name="Oro (XAU/USD)",       dec=2, kraken="PAXGUSD", yahoo="GC=F"),
-    "xau":    dict(code="XAUUSD", name="Oro (XAU/USD)",       dec=2, kraken="PAXGUSD", yahoo="GC=F"),
-    "xauusd": dict(code="XAUUSD", name="Oro (XAU/USD)",       dec=2, kraken="PAXGUSD", yahoo="GC=F"),
-    "eur":    dict(code="EURUSD", name="Euro/Dólar (EUR/USD)",dec=5, kraken="EURUSD",  yahoo="EURUSD=X"),
-    "eurusd": dict(code="EURUSD", name="Euro/Dólar (EUR/USD)",dec=5, kraken="EURUSD",  yahoo="EURUSD=X"),
-    "nas":    dict(code="NAS100", name="NASDAQ 100 (US100)",  dec=2, kraken=None,      yahoo="NQ=F"),
-    "nas100": dict(code="NAS100", name="NASDAQ 100 (US100)",  dec=2, kraken=None,      yahoo="NQ=F"),
-    "us100":  dict(code="NAS100", name="NASDAQ 100 (US100)",  dec=2, kraken=None,      yahoo="NQ=F"),
-}
 
-TFS = {
-    "1m":  dict(k_iv=1,   y_iv="1m",  y_rng="1d"),
-    "5m":  dict(k_iv=5,   y_iv="5m",  y_rng="5d"),
-    "15m": dict(k_iv=15,  y_iv="15m", y_rng="5d"),
-    "1h":  dict(k_iv=60,  y_iv="1h",  y_rng="1mo"),
-    "4h":  dict(k_iv=240, y_iv="1h",  y_rng="3mo", agg=4),
-    "1d":  dict(k_iv=1440,y_iv="1d",  y_rng="6mo"),
-}
+# ==========================================================
+# UTILIDADES Y PERSISTENCIA DE ALERTAS
+# ==========================================================
+def autorizado(uid):
+    if ALLOWED_ID is None:
+        return True
+    return uid == ALLOWED_ID
 
-# ------------------------------------------------------------------ #
-# DESCARGA DE VELAS OHLCV + VOLUMEN EN TIEMPO REAL
-# ------------------------------------------------------------------ #
-def _velas_kraken(pair: str, interval: int):
-    r = sess.get("https://api.kraken.com/0/public/OHLC", params={"pair": pair, "interval": interval}, timeout=8).json()
+
+def enviar_mensaje(chat_id, texto):
+    try:
+        sess.post(
+            f"{URL}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": texto,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        log.warning(f"Error enviando mensaje: {e}")
+
+
+def cargar_alertas():
+    with LOCK:
+        if not os.path.exists(ALERTAS_FILE):
+            return []
+        try:
+            with open(ALERTAS_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+
+
+def guardar_alertas(lista):
+    with LOCK:
+        try:
+            with open(ALERTAS_FILE, "w", encoding="utf-8") as f:
+                json.dump(lista, f, indent=2)
+        except Exception as e:
+            log.warning(f"Error guardando alertas: {e}")
+
+
+# ==========================================================
+# DESCARGA DE DATOS EN TIEMPO REAL (OHLCV)
+# ==========================================================
+def _kraken_ohlc(pair, interval_min):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={pair}&interval={interval_min}"
+    r = sess.get(url, timeout=12).json()
     if r.get("error"):
-        raise RuntimeError(str(r["error"]))
-    raw = [v for k, v in r["result"].items() if k != "last"][0]
+        raise ValueError(str(r["error"]))
+    res = r["result"]
+    key = [k for k in res.keys() if k != "last"][0]
     velas = []
-    for x in raw:
+    for row in res[key][-120:]:
         velas.append({
-            "t": int(x[0]),
-            "o": float(x[1]),
-            "h": float(x[2]),
-            "l": float(x[3]),
-            "c": float(x[4]),
-            "v": float(x[6]),
+            "t": int(row[0]),
+            "o": float(row[1]),
+            "h": float(row[2]),
+            "l": float(row[3]),
+            "c": float(row[4]),
+            "v": float(row[6]),
         })
-    return velas[-120:]
+    return velas
 
-def _velas_yahoo(symbol: str, interval: str, rng: str, agg: int = 1):
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-    r = sess.get(url, params={"interval": interval, "range": rng}, timeout=8).json()
-    res = r["chart"]["result"][0]
-    ts = res["timestamp"]
-    q = res["indicators"]["quote"][0]
+
+def _yahoo_ohlc(ticker, interval, range_str):
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={range_str}"
+    r = sess.get(url, timeout=12).json()
+    chart = r["chart"]["result"][0]
+    ts = chart["timestamp"]
+    q = chart["indicators"]["quote"][0]
     velas = []
     for i in range(len(ts)):
-        if q["close"][i] is None or q["high"][i] is None or q["low"][i] is None:
+        if q["open"][i] is None or q["close"][i] is None:
             continue
         velas.append({
             "t": int(ts[i]),
-            "o": float(q["open"][i] or q["close"][i]),
+            "o": float(q["open"][i]),
             "h": float(q["high"][i]),
             "l": float(q["low"][i]),
             "c": float(q["close"][i]),
-            "v": float(q["volume"][i] or 1.0),
+            "v": float(q["volume"][i] or 0.0),
         })
-    if agg > 1 and len(velas) >= agg:
-        velas = velas[len(velas) % agg:]
-        agrupadas = []
-        for i in range(0, len(velas), agg):
-            g = velas[i:i+agg]
-            agrupadas.append({
-                "t": g[0]["t"],
-                "o": g[0]["o"],
-                "h": max(x["h"] for x in g),
-                "l": min(x["l"] for x in g),
-                "c": g[-1]["c"],
-                "v": sum(x["v"] for x in g),
-            })
-        velas = agrupadas
     return velas[-120:]
 
-def obtener_velas(act_key: str, tf_key: str):
-    info = ACTIVOS[act_key]
-    tf = TFS[tf_key]
-    # Para NASDAQ usamos Yahoo directamente; para el resto intentamos Kraken y respaldo Yahoo
-    if info["kraken"]:
+
+def obtener_velas(activo, tf="15m"):
+    tf_map_kraken = {"5m": 5, "15m": 15, "1h": 60, "4h": 240}
+    tf_map_yahoo = {
+        "5m": ("5m", "5d"),
+        "15m": ("15m", "5d"),
+        "1h": ("60m", "1mo"),
+        "4h": ("60m", "3mo"),
+    }
+    k_int = tf_map_kraken.get(tf, 15)
+    y_int, y_rng = tf_map_yahoo.get(tf, ("15m", "5d"))
+
+    if activo == "BTCUSD":
         try:
-            v = _velas_kraken(info["kraken"], tf["k_iv"])
-            if len(v) >= 30:
-                return v
-        except Exception as e:
-            log.warning(f"Kraken fallback para {act_key}: {e}")
-    return _velas_yahoo(info["yahoo"], tf["y_iv"], tf["y_rng"], tf.get("agg", 1))
+            return _kraken_ohlc("XXBTZUSD", k_int), "Kraken Spot"
+        except Exception:
+            return _yahoo_ohlc("BTC-USD", y_int, y_rng), "Yahoo Finance"
 
-def precio_actual(act_key: str) -> float:
-    velas = obtener_velas(act_key, "5m")
-    return velas[-1]["c"]
+    if activo == "XAUUSD":
+        try:
+            return _yahoo_ohlc("GC=F", y_int, y_rng), "COMEX Gold (GC=F)"
+        except Exception:
+            return _kraken_ohlc("PAXGUSD", k_int), "Kraken PAXG"
 
-# ------------------------------------------------------------------ #
-# INDICADORES TÉCNICOS, VOLUMEN VSA/RVOL Y SMC
-# ------------------------------------------------------------------ #
-def calc_ema(p, n):
-    k = 2 / (n + 1)
-    v = p[0]
-    for x in p[1:]:
-        v = x * k + v * (1 - k)
-    return v
+    if activo == "EURUSD":
+        try:
+            return _kraken_ohlc("ZEURZUSD", k_int), "Kraken FX"
+        except Exception:
+            return _yahoo_ohlc("EURUSD=X", y_int, y_rng), "Yahoo FX"
 
-def calc_rsi(p, n=14):
-    g = [max(p[i] - p[i-1], 0) for i in range(1, len(p))]
-    l = [max(p[i-1] - p[i], 0) for i in range(1, len(p))]
-    ag = sum(g[:n]) / n
-    al = sum(l[:n]) / n
-    for i in range(n, len(g)):
-        ag = (ag * (n - 1) + g[i]) / n
-        al = (al * (n - 1) + l[i]) / n
-    return 100.0 if al == 0 else 100 - (100 / (1 + ag / al))
+    if activo == "NAS100":
+        return _yahoo_ohlc("NQ=F", y_int, y_rng), "CME E-Mini Nasdaq (NQ=F)"
 
-def calc_atr(velas, n=14):
+    raise ValueError("Activo no soportado")
+
+
+# ==========================================================
+# MOTOR CUANTITATIVO SMC, KILLZONES, ATR, RVOL Y SCORING
+# ==========================================================
+def detectar_killzone():
+    ahora_utc = datetime.now(timezone.utc)
+    h = ahora_utc.hour + ahora_utc.minute / 60.0
+    if 7.0 <= h < 10.0:
+        return "London Killzone (Alta liquidez)", 15
+    if 12.0 <= h < 15.0:
+        return "NY AM Killzone (Máxima liquidez)", 20
+    if 15.0 <= h < 17.0:
+        return "London Close / NY Midday", 10
+    if 0.0 <= h < 4.0:
+        return "Asian Range (Acumulación)", 5
+    return "Fuera de Killzone (Baja liquidez)", 0
+
+
+def calcular_atr(velas, periodo=14):
+    if len(velas) < periodo + 1:
+        return 0.0
     trs = []
     for i in range(1, len(velas)):
-        tr = max(
-            velas[i]["h"] - velas[i]["l"],
-            abs(velas[i]["h"] - velas[i-1]["c"]),
-            abs(velas[i]["l"] - velas[i-1]["c"]),
-        )
-        trs.append(tr)
-    return sum(trs[-n:]) / max(1, min(n, len(trs)))
+        h = velas[i]["h"]
+        l = velas[i]["l"]
+        pc = velas[i - 1]["c"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    return sum(trs[-periodo:]) / periodo
 
-def killzone_ny():
-    # Hora actual en Nueva York (UTC-5 invierno / UTC-4 verano)
-    utc_now = datetime.now(timezone.utc)
-    ny_now = utc_now - timedelta(hours=5)
-    h = ny_now.hour + ny_now.minute / 60.0
-    hora_str = ny_now.strftime("%H:%M EST")
-    if 8.0 <= h < 11.0:
-        return f"NY Open Killzone ({hora_str})", 15
-    if 2.0 <= h < 5.0:
-        return f"London Open Killzone ({hora_str})", 12
-    if 14.0 <= h < 15.0:
-        return f"Silver Bullet PM ({hora_str})", 10
-    if 16.0 <= h < 19.5:
-        return f"Zona Muerta Cierre NY ({hora_str})", 3
-    return f"Sesión Asia / Transición ({hora_str})", 8
 
-def detectar_smc(velas):
-    """Detecta PDH/PDL proxy, FVG (Fair Value Gaps), Order Blocks y Liquidez (BSL/SSL)."""
-    h = [v["h"] for v in velas]
-    l = [v["l"] for v in velas]
-    bsl = max(h[-30:-1])  # Buy-Side Liquidity (máximo relevante)
-    ssl = min(l[-30:-1])  # Sell-Side Liquidity (mínimo relevante)
-    eq = (bsl + ssl) / 2.0
+def analizar_mercado(activo, tf="15m", modo="ESTÁNDAR"):
+    velas, fuente = obtener_velas(activo, tf)
+    if len(velas) < 30:
+        return "No hay suficientes velas disponibles en este momento."
 
-    # Buscar último Fair Value Gap (FVG) en últimas 15 velas
+    actual = velas[-1]
+    precio = actual["c"]
+    dec = 5 if activo == "EURUSD" else 2
+
+    # 1. Rango de dealing (últimas 50 velas) y Premium/Discount
+    ventana = velas[-50:]
+    swing_high = max(v["h"] for v in ventana)
+    swing_low = min(v["l"] for v in ventana)
+    eq = (swing_high + swing_low) / 2.0
+    rango_total = max(swing_high - swing_low, 1e-9)
+    pos_pct = ((precio - swing_low) / rango_total) * 100.0
+
+    if pos_pct >= 62.0:
+        zona_pd = f"PREMIUM ({pos_pct:.1f}%)"
+    elif pos_pct <= 38.0:
+        zona_pd = f"DISCOUNT ({pos_pct:.1f}%)"
+    else:
+        zona_pd = f"EQUILIBRIO ({pos_pct:.1f}%)"
+
+    # 2. Estructura (MSS / BOS) comparando últimos 20 vs previos 20
+    prev_high = max(v["h"] for v in velas[-35:-10])
+    prev_low = min(v["l"] for v in velas[-35:-10])
+    rec_high = max(v["h"] for v in velas[-10:])
+    rec_low = min(v["l"] for v in velas[-10:])
+
+    if rec_high > prev_high and precio > eq:
+        estructura = "ALCISTA (BOS/MSS al alza)"
+        sesgo = "COMPRA"
+    elif rec_low < prev_low and precio < eq:
+        estructura = "BAJISTA (BOS/MSS a la baja)"
+        sesgo = "VENTA"
+    elif pos_pct <= 35.0:
+        estructura = "REVERSIÓN EN DISCOUNT"
+        sesgo = "COMPRA"
+    elif pos_pct >= 65.0:
+        estructura = "REVERSIÓN EN PREMIUM"
+        sesgo = "VENTA"
+    else:
+        estructura = "CONSOLIDACIÓN / RANGO"
+        sesgo = "NEUTRAL"
+
+    # 3. Detección de FVG (Fair Value Gap) reciente
     fvg_txt = "Sin FVG limpio cercano"
-    for i in range(len(velas) - 2, max(2, len(velas) - 15), -1):
-        # FVG Alcista: mínimo vela i+1 > máximo vela i-1
-        if velas[i+1]["l"] > velas[i-1]["h"]:
-            fvg_txt = f"FVG Alcista: {velas[i-1]['h']:.2f} - {velas[i+1]['l']:.2f}"
+    fvg_val = None
+    for i in range(len(velas) - 3, len(velas) - 18, -1):
+        v1, v3 = velas[i - 2], velas[i]
+        if v1["h"] < v3["l"]:
+            fvg_val = (v1["h"], v3["l"])
+            fvg_txt = f"FVG Alcista: {v1['h']:.{dec}f} - {v3['l']:.{dec}f}"
             break
-        # FVG Bajista: máximo vela i+1 < mínimo vela i-1
-        if velas[i+1]["h"] < velas[i-1]["l"]:
-            fvg_txt = f"FVG Bajista: {velas[i+1]['h']:.2f} - {velas[i-1]['l']:.2f}"
+        if v1["l"] > v3["h"]:
+            fvg_val = (v3["h"], v1["l"])
+            fvg_txt = f"FVG Bajista: {v3['h']:.{dec}f} - {v1['l']:.{dec}f}"
             break
 
-    # Barrido de liquidez (Sweep) en últimas 3 velas
-    sweep = "Ninguno reciente"
-    for v in velas[-3:]:
-        if v["l"] < ssl and v["c"] > ssl:
-            sweep = "Barrido SSL (Stop Hunt alcista detectado)"
-        elif v["h"] > bsl and v["c"] < bsl:
-            sweep = "Barrido BSL (Stop Hunt bajista detectado)"
+    # 4. Order Block (última vela contraria antes de impulso)
+    ob_txt = "No confirmado"
+    for i in range(len(velas) - 3, len(velas) - 20, -1):
+        v = velas[i]
+        impulso = abs(velas[i + 1]["c"] - velas[i + 1]["o"])
+        cuerpo = abs(v["c"] - v["o"])
+        if impulso > cuerpo * 1.8 and cuerpo > 0:
+            if sesgo == "COMPRA" and v["c"] < v["o"]:
+                ob_txt = f"OB Alcista: {v['l']:.{dec}f} - {v['h']:.{dec}f}"
+                break
+            if sesgo == "VENTA" and v["c"] > v["o"]:
+                ob_txt = f"OB Bajista: {v['l']:.{dec}f} - {v['h']:.{dec}f}"
+                break
 
-    return bsl, ssl, eq, fvg_txt, sweep
-
-def analizar_volumen(velas):
+    # 5. Volumen Relativo (RVOL) y ATR
     vols = [v["v"] for v in velas[-21:-1] if v["v"] > 0]
-    v_act = velas[-1]["v"]
-    if not vols or v_act <= 0:
-        return 1.0, "Volumen tick estándar (sin anomalía)"
-    rvol = v_act / (sum(vols) / len(vols))
-    v_last = velas[-1]
-    rango = max(1e-9, v_last["h"] - v_last["l"])
-    cuerpo = abs(v_last["c"] - v_last["o"])
-    mecha_inf = min(v_last["o"], v_last["c"]) - v_last["l"]
-    mecha_sup = v_last["h"] - max(v_last["o"], v_last["c"])
+    vol_prom = (sum(vols) / len(vols)) if vols else 0.0
+    rvol = (actual["v"] / vol_prom) if vol_prom > 0 else 1.0
+    atr = calcular_atr(velas, 14)
+    kz_nombre, kz_pts = detectar_killzone()
 
-    if rvol >= 1.4 and (mecha_inf > cuerpo * 1.3 or mecha_sup > cuerpo * 1.3):
-        vsa = "Absorción institucional (mecha + volumen climático)"
-    elif rvol >= 1.3 and cuerpo / rango > 0.65:
-        vsa = "Expansión con fuerza real (RVOL alto)"
-    elif rvol < 0.85:
-        vsa = "Volumen bajo / precaución ante falsa ruptura"
+    # 6. Sistema de Puntuación Cuantitativa (0 - 100 pts)
+    score = 30
+    score += kz_pts
+    if (sesgo == "COMPRA" and pos_pct <= 42.0) or (sesgo == "VENTA" and pos_pct >= 58.0):
+        score += 20
+    if fvg_val is not None:
+        score += 15
+    if ob_txt != "No confirmado":
+        score += 10
+    if rvol >= 1.2:
+        score += 10
+    if sesgo == "NEUTRAL":
+        score = min(score, 48)
+    score = min(score, 100)
+
+    # 7. Niveles exactos de Ejecución, SL y TP (Riesgo/Beneficio)
+    mult_sl = 1.2 if modo == "SCALPING" else 1.8
+    if sesgo == "COMPRA":
+        entrada = precio
+        sl = min(rec_low, precio - atr * mult_sl)
+        riesgo = max(entrada - sl, atr * 0.5)
+        tp1 = entrada + riesgo * 2.0
+        tp2 = max(swing_high, entrada + riesgo * 3.0)
+        accion = "🟢 BUSCAR COMPRAS (LONG)"
+    elif sesgo == "VENTA":
+        entrada = precio
+        sl = max(rec_high, precio + atr * mult_sl)
+        riesgo = max(sl - entrada, atr * 0.5)
+        tp1 = entrada - riesgo * 2.0
+        tp2 = min(swing_low, entrada - riesgo * 3.0)
+        accion = "🔴 BUSCAR VENTAS (SHORT)"
     else:
-        vsa = "Flujo normal equilibrado"
-    return rvol, vsa
+        entrada = precio
+        sl = precio - atr * mult_sl
+        tp1 = swing_high
+        tp2 = swing_low
+        accion = "🟡 ESPERAR CONFIRMACIÓN (RANGO)"
 
-# ------------------------------------------------------------------ #
-# MOTOR PRINCIPAL DE ANÁLISIS (SCALPING, DAY TRADING, SMC, COMPLETO)
-# ------------------------------------------------------------------ #
-def generar_reporte(act_key: str, tf_key: str, modo: str = "COMPLETO") -> str:
-    info = ACTIVOS[act_key]
-    dec = info["dec"]
-    velas = obtener_velas(act_key, tf_key)
-    c = [v["c"] for v in velas]
-    pr = c[-1]
-
-    e20 = calc_ema(c[-50:], 20)
-    e50 = calc_ema(c, 50)
-    macd = calc_ema(c[-40:], 12) - calc_ema(c[-60:], 26)
-    rsi = calc_rsi(c, 14)
-    atr = calc_atr(velas, 14)
-    bsl, ssl, eq, fvg_txt, sweep = detectar_smc(velas)
-    rvol, vsa_txt = analizar_volumen(velas)
-    kz_txt, kz_pts = killzone_ny()
-
-    # VWAP aproximado últimas 24 velas
-    vwap_num = sum(((v["h"] + v["l"] + v["c"]) / 3.0) * v["v"] for v in velas[-24:])
-    vwap_den = sum(v["v"] for v in velas[-24:]) or 1.0
-    vwap = vwap_num / vwap_den
-
-    # Matriz de puntuación cuantitativa (0 - 100 pts)
-    pts_est = 25 if (pr > e20 > e50 or pr < e20 < e50) else (15 if (pr > e50 or pr < e50) else 8)
-    alcista = pr >= e50
-    zona_pd = "Discount (Descuento)" if pr < eq else "Premium (Caro)"
-    pts_smc = 22 if ((alcista and pr <= eq) or (not alcista and pr >= eq)) else 12
-    if "Barrido" in sweep:
-        pts_smc = min(25, pts_smc + 5)
-
-    pts_vol = 20 if rvol >= 1.3 else (14 if rvol >= 0.95 else 7)
-    pts_mom = 15 if ((alcista and macd > 0 and 40 <= rsi <= 68) or (not alcista and macd < 0 and 32 <= rsi <= 60)) else 8
-    total_pts = min(100, pts_est + pts_smc + pts_vol + pts_mom + kz_pts)
-
-    # Decisión y niveles exactos con colchón ATR
-    if alcista and rsi >= 72:
-        veredicto = "🟡 ESPERAR RETROCESO (Sobrecompra)"
-        plan = (
-            f"• No perseguir arriba; esperar pullback a EMA20 / VWAP\n"
-            f"• Zona compra ideal: `{min(e20, vwap):,.{dec}f}`\n"
-            f"• SL técnico: `{min(e20, vwap) - atr * 1.4:,.{dec}f}`"
-        )
-    elif not alcista and rsi <= 28:
-        veredicto = "🟡 ESPERAR REBOTE (Sobreventa)"
-        plan = (
-            f"• Evitar vender en piso; esperar rebote a EMA20 / VWAP\n"
-            f"• Zona venta ideal: `{max(e20, vwap):,.{dec}f}`\n"
-            f"• SL técnico: `{max(e20, vwap) + atr * 1.4:,.{dec}f}`"
-        )
-    elif total_pts >= 75 and alcista:
-        ent = max(e20, pr - atr * 0.25)
-        sl = ent - atr * 1.5
-        tp1 = ent + atr * 2.2
-        tp2 = max(bsl, ent + atr * 3.5)
-        veredicto = "🟢 COMPRAR (BUY — Setup Válido)"
-        plan = (
-            f"• Entrada: `{ent:,.{dec}f}` (retesteo vela actual)\n"
-            f"• Stop Loss: `{sl:,.{dec}f}` (1.5x ATR)\n"
-            f"• TP1 (Break Even): `{tp1:,.{dec}f}` | TP2: `{tp2:,.{dec}f}`"
-        )
-    elif total_pts >= 75 and not alcista:
-        ent = min(e20, pr + atr * 0.25)
-        sl = ent + atr * 1.5
-        tp1 = ent - atr * 2.2
-        tp2 = min(ssl, ent - atr * 3.5)
-        veredicto = "🔴 VENDER (SELL — Setup Válido)"
-        plan = (
-            f"• Entrada: `{ent:,.{dec}f}` (retesteo vela actual)\n"
-            f"• Stop Loss: `{sl:,.{dec}f}` (1.5x ATR)\n"
-            f"• TP1 (Break Even): `{tp1:,.{dec}f}` | TP2: `{tp2:,.{dec}f}`"
-        )
-    else:
-        veredicto = "🟡 NO OPERAR (Confluencia < 75 pts)"
-        plan = (
-            f"• Mercado sin alineación completa. Esperar ruptura confirmada:\n"
-            f"• Ruptura alcista: > `{bsl:,.{dec}f}` | Bajista: < `{ssl:,.{dec}f}`"
-        )
-
-    tend_txt = "🟢 Alcista" if pr > e20 > e50 else ("🔴 Bajista" if pr < e20 < e50 else "🟡 Rango / Transición")
+    semaforo = "🔥 ALTA PROBABILIDAD" if score >= 75 else ("⚠️ MODERADA" if score >= 55 else "🛑 NO OPERAR / ESPERAR")
 
     return (
-        f"📊 *{info['name']} ({tf_key.upper()}) | {modo}*\n"
-        f"🕒 {kz_txt}\n\n"
-        f"💰 *Precio:* `{pr:,.{dec}f}` | *VWAP:* `{vwap:,.{dec}f}`\n"
-        f"🧭 *Tendencia:* {tend_txt} | *Zona:* {zona_pd}\n"
-        f"〰️ *EMA20:* `{e20:,.{dec}f}` | *EMA50:* `{e50:,.{dec}f}`\n"
-        f"⚡ *RSI(14):* `{rsi:.1f}` | *ATR(14):* `{atr:,.{dec}f}`\n\n"
-        f"🎯 *LIQUIDEZ Y SMC*\n"
-        f"• *Techo / BSL:* `{bsl:,.{dec}f}`\n"
-        f"• *Piso / SSL:* `{ssl:,.{dec}f}`\n"
-        f"• *Desequilibrio:* {fvg_txt}\n"
-        f"• *Trampas:* {sweep}\n\n"
-        f"📶 *VOLUMEN (RVOL: {rvol:.2f}x)*\n"
-        f"• {vsa_txt}\n\n"
-        f"🧮 *CONFLUENCIA: {total_pts}/100 pts*\n"
-        f"🚦 *VEREDICTO:* *{veredicto}*\n\n"
-        f"⚡ *PLAN DE EJECUCIÓN*\n{plan}"
+        f"📊 <b>ANÁLISIS SMC — {activo} ({tf.upper()})</b>\n"
+        f"<i>Modo: {modo} | Fuente: {fuente}</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>Precio Actual:</b> <code>{precio:.{dec}f}</code>\n"
+        f"🎯 <b>Score Cuantitativo:</b> <b>{score}/100</b> ({semaforo})\n"
+        f"📌 <b>Sesgo:</b> {accion}\n\n"
+        f"🏛 <b>Estructura & Liquidez:</b>\n"
+        f"• Estructura: {estructura}\n"
+        f"• Zona P/D: {zona_pd}\n"
+        f"• Swing High (BSL): <code>{swing_high:.{dec}f}</code>\n"
+        f"• Equilibrium (50%): <code>{eq:.{dec}f}</code>\n"
+        f"• Swing Low (SSL): <code>{swing_low:.{dec}f}</code>\n\n"
+        f"🧲 <b>Confluencias Institucionales:</b>\n"
+        f"• {fvg_txt}\n"
+        f"• {ob_txt}\n"
+        f"• Sesión: {kz_nombre}\n"
+        f"• RVOL: {rvol:.2f}x | ATR(14): {atr:.{dec}f}\n\n"
+        f"📐 <b>Plan de Ejecución:</b>\n"
+        f"• Entrada: <code>{entrada:.{dec}f}</code>\n"
+        f"• Stop Loss: <code>{sl:.{dec}f}</code>\n"
+        f"• TP1 (1:2): <code>{tp1:.{dec}f}</code>\n"
+        f"• TP2 (Liquidez): <code>{tp2:.{dec}f}</code>"
     )
 
-def plan_multitf(act_key: str) -> str:
-    info = ACTIVOS[act_key]
-    dec = info["dec"]
-    v1h = obtener_velas(act_key, "1h")
-    v15 = obtener_velas(act_key, "15m")
-    c1h = [x["c"] for x in v1h]
-    c15 = [x["c"] for x in v15]
-    alc_1h = c1h[-1] > calc_ema(c1h, 50)
-    alc_15 = c15[-1] > calc_ema(c15[-50:], 20)
-    alineado = alc_1h == alc_15
-    estado = "✅ *ALTA PROBABILIDAD (1H y 15M alineados)*" if alineado else "⚠️ *PRECAUCIÓN (1H y 15M en contra)*"
-    rep_15 = generar_reporte(act_key, "15m", "MULTI-TF")
-    return (
-        f"🎯 *CRUCE MULTI-TEMPORALIDAD — {info['name']}*\n"
-        f"• *Sesgo 1H:* {'🟢 Alcista' if alc_1h else '🔴 Bajista'}\n"
-        f"• *Gatillo 15M:* {'🟢 Alcista' if alc_15 else '🔴 Bajista'}\n"
-        f"{estado}\n\n" + rep_15
-    )
 
-# ------------------------------------------------------------------ #
-# GESTIÓN DE ALERTAS Y TELEGRAM
-# ------------------------------------------------------------------ #
-def cargar_alertas():
-    if os.path.exists(ALERTAS_FILE):
-        try:
-            with open(ALERTAS_FILE) as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return []
+def analizar_plan_multitf(activo):
+    r1h = analizar_mercado(activo, "1h", "DAY TRADING")
+    r15m = analizar_mercado(activo, "15m", "CONFIRMACIÓN M15")
+    return f"🧭 <b>PLAN MULTI-TEMPORAL (1H + 15M)</b>\n\n{r1h}\n\n━━━━━━━━━━━━━━━━━━━━\n\n{r15m}"
 
-def guardar_alertas(data):
-    with open(ALERTAS_FILE, "w") as f:
-        json.dump(data, f)
 
-alertas = cargar_alertas()
+# ==========================================================
+# VIGILANTE DE ALERTAS EN SEGUNDO PLANO
+# ==========================================================
+def normalizar_activo(txt):
+    t = txt.upper().strip()
+    if t in ("BTC", "BTCUSD", "BITCOIN"):
+        return "BTCUSD"
+    if t in ("ORO", "XAU", "XAUUSD", "GOLD"):
+        return "XAUUSD"
+    if t in ("EUR", "EURUSD"):
+        return "EURUSD"
+    if t in ("NAS", "NAS100", "NASDAQ", "NQ"):
+        return "NAS100"
+    return None
 
-def enviar(chat_id: str, txt: str):
-    try:
-        r = sess.post(f"{URL}/sendMessage", data={"chat_id": chat_id, "text": txt, "parse_mode": "Markdown"}, timeout=8).json()
-        if not r.get("ok"):
-            sess.post(f"{URL}/sendMessage", data={"chat_id": chat_id, "text": txt}, timeout=8)
-    except Exception as e:
-        log.error(f"Error enviando mensaje: {e}")
 
-def procesar_mensaje(chat_id: str, user_id: str, txt: str):
-    if ALLOWED_USER and user_id != ALLOWED_USER:
-        enviar(chat_id, "⛔ Bot privado.")
+def vigilar_alertas():
+    while True:
+        time.sleep(30)
+        alertas = cargar_alertas()
+        if not alertas:
+            continue
+        restantes = []
+        cambio = False
+        for a in alertas:
+            try:
+                velas, _ = obtener_velas(a["activo"], "5m")
+                precio = velas[-1]["c"]
+                disparada = False
+                if a["tipo"] == "COMPRA" and precio <= a["objetivo"]:
+                    disparada = True
+                elif a["tipo"] == "VENTA" and precio >= a["objetivo"]:
+                    disparada = True
+
+                if disparada:
+                    cambio = True
+                    enviar_mensaje(
+                        a["chat_id"],
+                        f"🚨 <b>ALERTA SMC EJECUTADA</b> 🚨\n"
+                        f"• Activo: <b>{a['activo']}</b>\n"
+                        f"• Dirección: <b>{a['tipo']}</b>\n"
+                        f"• Nivel Objetivo: <code>{a['objetivo']}</code>\n"
+                        f"• Precio Actual: <code>{precio}</code>",
+                    )
+                else:
+                    restantes.append(a)
+            except Exception:
+                restantes.append(a)
+        if cambio:
+            guardar_alertas(restantes)
+
+
+# ==========================================================
+# PROCESAMIENTO DE COMANDOS TELEGRAM
+# ==========================================================
+def procesar_mensaje(upd):
+    msg = upd.get("message") or upd.get("edited_message")
+    if not msg or "text" not in msg:
         return
 
-    try:
-        sess.post(f"{URL}/sendChatAction", data={"chat_id": chat_id, "action": "typing"}, timeout=3)
-    except Exception:
-        pass
+    chat_id = msg["chat"]["id"]
+    uid = msg["from"]["id"]
+    texto = msg["text"].strip()
 
-    p = txt.replace("\xa0", " ").strip().lower().split()
-    cmd = p[0] if p else ""
+    if not autorizado(uid):
+        enviar_mensaje(chat_id, "⛔ Acceso no autorizado.")
+        return
 
-    if cmd in ("/start", "/help", "/ayuda"):
-        enviar(
-            chat_id,
-            "🤖 *BOT CUANTITATIVO SMC — EN VIVO*\n\n"
-            "📊 *Análisis Directo (Datos Reales Automáticos):*\n"
-            "• `/btc 1h` (soporta `1m, 5m, 15m, 1h, 4h, 1d`)\n"
-            "• `/oro 15m` o `/xau 1h`\n"
-            "• `/eurusd 1h` o `/eur 15m`\n"
-            "• `/nas100 15m` o `/nas 1h`\n\n"
-            "⚡ *Modos Especializados:*\n"
-            "• `/scalping oro` (análisis rápido M5)\n"
-            "• `/daytrading nas100` (análisis H1 + H4)\n"
-            "• `/plan btc` (cruce 1H + 15M)\n\n"
-            "🔔 *Alertas de Precio:*\n"
-            "• `/comprar oro 2650` | `/vender btc 95000`\n"
-            "• `/alertas` | `/borrar`"
+    partes = texto.split()
+    cmd = partes[0].lower().split("@")[0]
+
+    if cmd == "/start":
+        panel = (
+            "🤖 <b>BOT CUANTITATIVO SMC — EN VIVO</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Análisis institucional automático con liquidez, FVG, Order Blocks, Killzones, RVOL y Score (0-100).\n\n"
+            "📈 <b>Análisis por Activo:</b>\n"
+            "• <code>/btc 1h</code> — Bitcoin (5m, 15m, 1h, 4h)\n"
+            "• <code>/oro 15m</code> — Oro XAU/USD\n"
+            "• <code>/eurusd 1h</code> — Euro / Dólar\n"
+            "• <code>/nas100 15m</code> — NASDAQ 100\n\n"
+            "⚡ <b>Modos Operativos:</b>\n"
+            "• <code>/scalping oro</code> — Gatillo rápido M5\n"
+            "• <code>/daytrading nas100</code> — Estructura H1\n"
+            "• <code>/plan btc</code> — Cruce Multi-TF (1H + 15M)\n\n"
+            "🔔 <b>Alertas de Precio 24/7:</b>\n"
+            "• <code>/comprar oro 2650</code>\n"
+            "• <code>/vender btc 95000</code>\n"
+            "• <code>/alertas</code> | <code>/borrar</code>"
         )
+        enviar_mensaje(chat_id, panel)
         return
 
-    if cmd in ("/btc", "/btcusd", "/oro", "/xau", "/xauusd", "/eur", "/eurusd", "/nas", "/nas100", "/us100"):
-        act = cmd[1:]
-        tf = p[1] if len(p) > 1 and p[1] in TFS else "1h"
+    mapa_directo = {
+        "/btc": "BTCUSD",
+        "/oro": "XAUUSD",
+        "/eurusd": "EURUSD",
+        "/nas100": "NAS100",
+    }
+    if cmd in mapa_directo:
+        tf = partes[1].lower() if len(partes) > 1 and partes[1].lower() in ("5m", "15m", "1h", "4h") else "15m"
+        enviar_mensaje(chat_id, f"⏳ Analizando <b>{mapa_directo[cmd]}</b> en {tf.upper()}...")
         try:
-            enviar(chat_id, generar_reporte(act, tf, f"TF {tf.upper()}"))
+            res = analizar_mercado(mapa_directo[cmd], tf, "ESTÁNDAR")
+            enviar_mensaje(chat_id, res)
         except Exception as e:
-            enviar(chat_id, f"⚠️ Error obteniendo datos de mercado: {e}")
+            enviar_mensaje(chat_id, f"❌ Error obteniendo datos: {e}")
         return
 
-    if cmd == "/scalping":
-        act = p[1] if len(p) > 1 and p[1] in ACTIVOS else "oro"
+    if cmd in ("/scalping", "/daytrading", "/plan"):
+        if len(partes) < 2:
+            enviar_mensaje(chat_id, f"⚠️ Indica el activo. Ejemplo: <code>{cmd} oro</code>")
+            return
+        activo = normalizar_activo(partes[1])
+        if not activo:
+            enviar_mensaje(chat_id, "⚠️ Activo no reconocido. Usa: btc, oro, eurusd o nas100.")
+            return
+        enviar_mensaje(chat_id, f"⏳ Calculando {cmd.upper()} para <b>{activo}</b>...")
         try:
-            enviar(chat_id, generar_reporte(act, "5m", "SCALPING M5"))
+            if cmd == "/scalping":
+                res = analizar_mercado(activo, "5m", "SCALPING")
+            elif cmd == "/daytrading":
+                res = analizar_mercado(activo, "1h", "DAY TRADING")
+            else:
+                res = analizar_plan_multitf(activo)
+            enviar_mensaje(chat_id, res)
         except Exception as e:
-            enviar(chat_id, f"⚠️ Error scalping {act}: {e}")
-        return
-
-    if cmd == "/daytrading":
-        act = p[1] if len(p) > 1 and p[1] in ACTIVOS else "oro"
-        try:
-            enviar(chat_id, generar_reporte(act, "1h", "DAY TRADING H1"))
-        except Exception as e:
-            enviar(chat_id, f"⚠️ Error daytrading {act}: {e}")
-        return
-
-    if cmd == "/plan":
-        act = p[1] if len(p) > 1 and p[1] in ACTIVOS else "btc"
-        try:
-            enviar(chat_id, plan_multitf(act))
-        except Exception as e:
-            enviar(chat_id, f"⚠️ Error plan {act}: {e}")
+            enviar_mensaje(chat_id, f"❌ Error en análisis: {e}")
         return
 
     if cmd in ("/comprar", "/vender"):
-        tipo = "COMPRA" if cmd == "/comprar" else "VENTA"
+        if len(partes) < 3:
+            enviar_mensaje(chat_id, f"⚠️ Formato: <code>{cmd} oro 2650</code>")
+            return
+        activo = normalizar_activo(partes[1])
+        if not activo:
+            enviar_mensaje(chat_id, "⚠️ Activo inválido. Usa: btc, oro, eurusd o nas100.")
+            return
         try:
-            act = p[1] if len(p) >= 3 and p[1] in ACTIVOS else "btc"
-            val = p[2] if len(p) >= 3 and p[1] in ACTIVOS else p[1]
-            obj = float(val.replace(",", ""))
-            info = ACTIVOS[act]
-            act_p = precio_actual(act)
-            dir_a = "abajo" if obj < act_p else "arriba"
-            alertas.append({"chat_id": chat_id, "activo": act, "tipo": tipo, "precio": obj, "direccion": dir_a})
-            guardar_alertas(alertas)
-            enviar(chat_id, f"🔔 *Alerta {tipo} ({info['name']})* en `{obj:,.{info['dec']}f}` (Actual: `{act_p:,.{info['dec']}f}`)")
-        except Exception:
-            enviar(chat_id, "⚠️ Uso correcto: `/comprar oro 2650` o `/vender nas100 21500`")
+            objetivo = float(partes[2].replace(",", "."))
+        except ValueError:
+            enviar_mensaje(chat_id, "⚠️ El precio debe ser un número válido.")
+            return
+        tipo = "COMPRA" if cmd == "/comprar" else "VENTA"
+        alertas = cargar_alertas()
+        alertas.append({
+            "chat_id": chat_id,
+            "activo": activo,
+            "tipo": tipo,
+            "objetivo": objetivo,
+        })
+        guardar_alertas(alertas)
+        enviar_mensaje(chat_id, f"✅ Alerta guardada: <b>{tipo}</b> en <b>{activo}</b> a <code>{objetivo}</code>.")
         return
 
     if cmd == "/alertas":
+        alertas = cargar_alertas()
         if not alertas:
-            enviar(chat_id, "📭 No tienes alertas activas.")
-        else:
-            msg = "\n".join(f"{i}. {a['activo'].upper()} {a['tipo']} @ {a['precio']}" for i, a in enumerate(alertas, 1))
-            enviar(chat_id, f"🔔 *Alertas activas:*\n{msg}")
+            enviar_mensaje(chat_id, "📭 No tienes alertas activas.")
+            return
+        lineas = ["🔔 <b>Alertas Activas:</b>"]
+        for idx, a in enumerate(alertas, 1):
+            lineas.append(f"{idx}. <b>{a['activo']}</b> — {a['tipo']} en <code>{a['objetivo']}</code>")
+        enviar_mensaje(chat_id, "\n".join(lineas))
         return
 
     if cmd == "/borrar":
-        alertas.clear()
-        guardar_alertas(alertas)
-        enviar(chat_id, "🗑️ Todas las alertas fueron eliminadas.")
+        guardar_alertas([])
+        enviar_mensaje(chat_id, "🗑 Todas las alertas han sido eliminadas.")
         return
 
-# ------------------------------------------------------------------ #
-# SERVIDOR WEB DE SALUD (RENDER + UPTIMEROBOT)
-# ------------------------------------------------------------------ #
-def _health_server():
-    port = int(os.environ.get("PORT", 10000))
-    class H(BaseHTTPRequestHandler):
+
+# ==========================================================
+# SERVIDOR DE SALUD HTTP (RENDER / UPTIMEROBOT)
+# ==========================================================
+def iniciar_servidor_salud():
+    port = int(os.environ.get("PORT", "10000"))
+
+    class HealthHandler(BaseHTTPRequestHandler):
         def do_GET(self):
-            body = b"smcbot: ok"
             self.send_response(200)
-            self.send_header("Content-Type", "text/plain")
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
-            self.wfile.write(body)
+            self.wfile.write(b"OK - SMC Bot Online")
+
         def do_HEAD(self):
             self.send_response(200)
             self.end_headers()
-        def log_message(self, *a):
-            pass
-    threading.Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", port), H).serve_forever(), daemon=True).start()
 
-def registrar_comandos():
-    try:
-        sess.post(f"{URL}/setMyCommands", json={"commands": [
-            {"command": "btc",        "description": "Análisis en vivo BTC/USD (ej. /btc 1h)"},
-            {"command": "oro",        "description": "Análisis en vivo Oro XAU/USD (ej. /oro 15m)"},
-            {"command": "eurusd",     "description": "Análisis en vivo EUR/USD (ej. /eurusd 1h)"},
-  
+        def log_message(self, format, *args):
+            pass
+
+    srv = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    threading.Thread(target=srv.serve_forever
+            
