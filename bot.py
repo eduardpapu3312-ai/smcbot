@@ -535,7 +535,8 @@ def iniciar_servidor_salud():
 
         def log_message(self, format, *args):
             pass
-
+        
     srv = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
-    threading.Thread(target=srv.serve_forever
-            
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    
